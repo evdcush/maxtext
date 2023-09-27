@@ -16,8 +16,6 @@
 
 """Input pipeline"""
 
-import os
-
 import tensorflow_datasets as tfds
 import jax
 import jax.numpy as jnp
@@ -121,10 +119,67 @@ class SyntheticDataIterator():
                                                     dtype=jax.numpy.int32)
     return output
 
+class BadSyntheticDataIterator():
+  """Creates a synthetic data iterator for performance testing work"""
+  def __init__(self, config, mesh):
+    self.mesh = mesh
+    self.config = config
+    data_pspec = P(*config.data_sharding)
+    data_pspec_shardings = jax.tree_map(
+        lambda p: jax.sharding.NamedSharding(mesh, p), data_pspec)
+    self.data_generator = jax.jit(BadSyntheticDataIterator.get_bad_synthetic_data,
+        out_shardings=data_pspec_shardings,
+        static_argnums=0)
+
+  def __iter__(self):
+    return self
+
+  def __next__(self):
+    with self.mesh:
+      return self.data_generator(self.config)
+
+  @staticmethod
+  def get_bad_synthetic_data(config):
+    """fill negative value in synthetic data """
+    output = {}
+    output['inputs'] = jax.numpy.full( (config.global_batch_size_to_load,
+                                        config.max_target_length), -1, dtype=jax.numpy.int32)
+    output['inputs_position'] = jax.numpy.full((config.global_batch_size_to_load,
+                                                    config.max_target_length), -1, dtype=jax.numpy.int32)
+    output['inputs_segmentation'] = jax.numpy.full( (config.global_batch_size_to_load,
+                                                    config.max_target_length), -1, dtype=jax.numpy.int32)
+    output['targets'] = jax.numpy.full( (config.global_batch_size_to_load,
+                                          config.max_target_length), -1, dtype=jax.numpy.int32)
+    output['targets_position'] = jax.numpy.full( (config.global_batch_size_to_load,
+                                                  config.max_target_length), -1, dtype=jax.numpy.int32)
+    output['targets_segmentation'] = jax.numpy.full( (config.global_batch_size_to_load,
+                                                      config.max_target_length), -1, dtype=jax.numpy.int32)
+    return output
+
+def get_process_loading_real_data(config, mesh):
+  sharding = jax.sharding.NamedSharding(mesh, P(*config.data_sharding))
+  devices_indices_map = sharding.devices_indices_map((config.global_batch_size_to_load, config.max_target_length))
+  batch_cutoff = config.global_batch_size_to_train_on
+  process_loading_real_data = set()
+  for p, indices in devices_indices_map.items():
+    if indices[0].stop <= batch_cutoff:
+      process_loading_real_data.add(p.process_index)
+  return process_loading_real_data
+
+def make_mixed_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos):
+  process_indices = get_process_loading_real_data(config, mesh)
+  print(len(process_indices),"hosts are loading real data")
+  if jax.process_index() in process_indices:
+    return make_c4_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos)
+  else:
+    return BadSyntheticDataIterator(config, mesh), None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
+
 def create_data_iterator_with_tokenizer(config, mesh, add_bos = True, add_eos = True):
   if config.dataset_type == "synthetic":
     return SyntheticDataIterator(config, mesh), None, get_tokenizer(config.tokenizer_path, add_bos, add_eos)
   elif config.dataset_type == "c4":
+    if config.expansion_factor_real_data != -1:
+      return make_mixed_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos)
     return make_c4_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos)
   elif config.dataset_type == "c4-array_record":
     return make_grain_train_iterator_and_tokenizer(config, mesh, add_bos, add_eos)
