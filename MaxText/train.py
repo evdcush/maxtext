@@ -58,6 +58,8 @@ from cloud_tpu_diagnostics.configuration import stack_trace_configuration
 
 from layers import quantizations
 
+from ml_goodput_measurement import goodput
+
 Transformer = models.Transformer
 EPS = 1e-8
 
@@ -415,6 +417,8 @@ def train_loop(config, state=None):
   local_metrics_file = open(config.metrics_file, 'a', encoding="utf8") if config.metrics_file else None
   running_gcs_metrics = [] if config.gcs_metrics else None
 
+  logger_name = f'goodput_{config.run_name}'
+  goodput_recorder = goodput.GoodputRecorder(config.run_name, logger_name, jax.process_index() == 0)
   start_step = get_first_step(state) # this is the start_step for training
   first_profiling_step = start_step + config.skip_first_n_steps_for_profiler
   if config.enable_profiler and first_profiling_step >= config.steps:
@@ -430,6 +434,7 @@ def train_loop(config, state=None):
 
     example_batch = load_next_batch(data_iterator, example_batch, config)
     nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
+    goodput_recorder.record_step_start_time(step)
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       state, metrics = p_train_step(
           state, example_batch, nextrng
@@ -494,9 +499,16 @@ def main(argv: Sequence[str]) -> None:
       stack_trace_to_cloud = config.stack_trace_to_cloud,
       stack_trace_interval_seconds = config.stack_trace_interval_seconds))
   diagnostic_config = diagnostic_configuration.DiagnosticConfig(debug_config)
+  logger_name = f'goodput_{config.run_name}'
+  goodput_recorder = goodput.GoodputRecorder(config.run_name, logger_name, jax.process_index() == 0)
+  goodput_recorder.record_job_start_time()
   with diagnostic.diagnose(diagnostic_config):
     train_loop(config)
+  goodput_recorder.record_job_end_time()
 
+  goodput_calculator = goodput.GoodputCalculator(config.run_name, logger_name)
+  total_goodput = goodput_calculator.get_job_goodput()
+  max_logging.log(f"Total job goodput: {total_goodput:.2f}%")
 
 if __name__ == "__main__":
   app.run(main)
