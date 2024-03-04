@@ -434,7 +434,8 @@ def train_loop(config, state=None):
 
     example_batch = load_next_batch(data_iterator, example_batch, config)
     nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
-    goodput_recorder.record_step_start_time(step)
+    if config.enable_goodput_record:
+      goodput_recorder.record_step_start_time(step)
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       state, metrics = p_train_step(
           state, example_batch, nextrng
@@ -501,14 +502,19 @@ def main(argv: Sequence[str]) -> None:
   diagnostic_config = diagnostic_configuration.DiagnosticConfig(debug_config)
   logger_name = f'goodput_{config.run_name}'
   goodput_recorder = goodput.GoodputRecorder(config.run_name, logger_name, jax.process_index() == 0)
-  goodput_recorder.record_job_start_time()
+  if config.enable_goodput_record:
+    goodput_recorder.record_job_start_time()
   with diagnostic.diagnose(diagnostic_config):
     train_loop(config)
-  goodput_recorder.record_job_end_time()
+  if config.enable_goodput_record:
+    goodput_recorder.record_job_end_time()
 
-  goodput_calculator = goodput.GoodputCalculator(config.run_name, logger_name)
-  total_goodput = goodput_calculator.get_job_goodput()
-  max_logging.log(f"Total job goodput: {total_goodput:.2f}%")
+  # Get overall Goodput of the entire job.
+  # Note: Run separate user script on a different machine to continuously query instantaneous Goodput.
+  if config.enable_goodput_calculate:
+    goodput_calculator = goodput.GoodputCalculator(config.run_name, logger_name)
+    total_goodput = goodput_calculator.get_job_goodput()
+    max_logging.log(f"Total job goodput: {total_goodput:.2f}%")
 
 if __name__ == "__main__":
   app.run(main)

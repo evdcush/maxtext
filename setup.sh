@@ -206,6 +206,3 @@ fi
 
 # Install dependencies from requirements.txt
 cd $run_name_folder_path && pip install --upgrade pip &&  pip3 install -r requirements.txt
-
-# TODO(dishaw): Remove this is a test version
-pip install -i https://test.pypi.org/simple/ ml-goodput-measurement
