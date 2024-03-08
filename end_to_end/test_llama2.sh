@@ -37,7 +37,7 @@ unset M_LOAD_PARAMETERS_PATH
 export PARAMETER_CHECKPOINT_RUN=generate_param_only_checkpoint_${idx}
 python3 MaxText/generate_param_only_checkpoint.py MaxText/configs/base.yml load_full_state_path=${M_BASE_OUTPUT_DIRECTORY}/runner_finetuning_${idx}/checkpoints/5/default run_name=${PARAMETER_CHECKPOINT_RUN} model_name='llama2-7b' force_unroll=true
 
-export new_ckpt_path=${M_BASE_OUTPUT_DIRECTORY}/${PARAMETER_CHECKPOINT_RUN}/checkpoints/0/default
+export new_ckpt_path=${M_BASE_OUTPUT_DIRECTORY}/${PARAMETER_CHECKPOINT_RUN}/checkpoints/0/items
 
 # Load fine-tuned parameter checkpoint into decode.py
 python3 MaxText/decode.py MaxText/configs/base.yml load_parameters_path=${new_ckpt_path} run_name=runner_decode_finetuned_${idx} per_device_batch_size=1 model_name='llama2-7b' ici_tensor_parallelism=4 max_prefill_predict_length=4  max_target_length=16 prompt="I love to" attention=dot_product scan_layers=false

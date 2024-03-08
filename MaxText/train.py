@@ -165,12 +165,16 @@ def save_checkpoint(checkpoint_manager, step, state, dataset_type='c4', data_ite
   """Wrapper for saving checkpoint"""
   if dataset_type == 'c4-array_record':
     return checkpoint_manager.save(step, args=orbax.checkpoint.args.Composite(
-                                                    default=orbax.checkpoint.args.StandardSave(state),
+                                                    items=orbax.checkpoint.args.PyTreeSave(item=state),
                                                     iter=grain.PyGrainCheckpointSave(data_iterator.local_iterator)
                                                     ))
   else:
-    return checkpoint_manager.save(step, args=orbax.checkpoint.args.Composite(
-                                                    default=orbax.checkpoint.args.StandardSave(state)))
+    return checkpoint_manager.save(
+      step,
+      args=orbax.checkpoint.args.Composite(
+        items=orbax.checkpoint.args.PyTreeSave(item=state)
+        ))
+
 # -----------------------------------------------------------------------------
 # Top-level Functions
 # -----------------------------------------------------------------------------
@@ -322,6 +326,7 @@ def setup_mesh_and_model(config):
   tx = optimizers.get_optimizer(config, learning_rate_schedule)
   return init_rng, writer, checkpoint_manager, mesh, model, learning_rate_schedule, tx
 
+
 def setup_train_loop(config):
   """ Set up prerequisites for the training loop -
       checkpoint_manager, PRNG keys, Mesh, Model and optimizer.
@@ -347,7 +352,7 @@ def setup_train_loop(config):
   state, state_mesh_annotations, data_iterator = max_utils.setup_training_state(model, data_iterator,
           tx, config, init_rng, mesh, checkpoint_manager)
 
-  return ( init_rng, writer, checkpoint_manager, state_mesh_annotations, model,
+  return (init_rng, writer, checkpoint_manager, state_mesh_annotations, model,
           mesh, learning_rate_schedule, data_iterator, eval_data_iterator, state)
 
 
@@ -359,7 +364,7 @@ def train_loop(config, state=None):
     ckpt_path:
   Returns:
   """
-  ( init_rng, writer, checkpoint_manager, state_mesh_annotations, model,
+  (init_rng, writer, checkpoint_manager, state_mesh_annotations, model,
   mesh, learning_rate_schedule, data_iterator, eval_data_iterator, state) = setup_train_loop(config)
   # pylint: disable=line-too-long
   functional_train, in_shard_train, out_shard_train, static_argnums_train, donate_argnums_train = maxtext_utils.get_functional_train_with_signature(
