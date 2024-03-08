@@ -99,7 +99,7 @@ class AttentionOp(nn.Module):
   num_query_heads: int
   num_kv_heads: int
   float32_qk_product: bool = False
-  max_prefill_predict_length: int = -1 
+  max_prefill_predict_length: int = -1
   float32_logits: bool = False
   flash_axis_names: AxisNames = (BATCH, HEAD, LENGTH, D_KV)
   dropout_rate: float = 0.
@@ -161,18 +161,22 @@ class AttentionOp(nn.Module):
   def apply_attention(self,
       query: Array,
       key: Array,
+      key_scale: Array,
       value: Array,
+      value_scale: Array,
       decoder_segment_ids: Array | None,
       model_mode: str):
     self.check_attention_inputs(query, key, value)
     if self.attention_kernel == "dot_product":
-      return self.apply_attention_dot(query, key, value, decoder_segment_ids, model_mode)
+      return self.apply_attention_dot(query, key, key_scale, value, value_scale, decoder_segment_ids, model_mode)
     elif self.attention_kernel == 'flash':
+      assert not key_scale, 'KV quantization not supported for flash kernel'
       if model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
         raise ValueError("""Decode not supported with flash attention.
                             Use `dot_product` instead.""")
       return self.tpu_flash_attention(query, key, value, decoder_segment_ids), None, None
     elif self.attention_kernel == 'cudnn_flash_te':
+      assert not key_scale, 'KV quantization not supported for cudnn_flash_te kernel'
       if model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
         raise ValueError("""Decode not supported with flash attention.
                            Use `dot_product` instead.""")
@@ -236,7 +240,7 @@ class AttentionOp(nn.Module):
                                                               head_shards = 1,
                                                               q_seq_shards = 1,
                                                               block_sizes = block_sizes)
-      
+
       return jax.vmap(splash_kernel)(query,key,value, segment_ids = decoder_segment_ids)
 
     devices_in_data_fsdp = self.mesh.shape['data'] * self.mesh.shape['fsdp']
@@ -258,7 +262,7 @@ class AttentionOp(nn.Module):
     A stable flash attention API will be included soon. Currently,
     1. It does not support GQA, num_query_heads == num_kv_heads
     2. It supports head_dim till 128
-    GQA support with head_dim=256 will be added soon 
+    GQA support with head_dim=256 will be added soon
     """
     import transformer_engine.jax.fused_attn as fused_attn
     from transformer_engine.jax.fused_attn import AttnBiasType, AttnMaskType, QKVLayout
@@ -300,9 +304,10 @@ class AttentionOp(nn.Module):
         is_training=True)
 
   def compute_local_attention(self,
-                              attn_weights: Array, 
-                              value: Array) -> tuple[Array, Array, Array]:
-    """Computes the attention of a local subset of the kv cache. 
+                              attn_weights: Array,
+                              value: Array,
+                              value_scale: Array) -> tuple[Array, Array, Array]:
+    """Computes the attention of a local subset of the kv cache.
     Local attention results will need to be combined with any other local attentions and normalized
     Based on https://github.com/google-research/google-research/blob/master/scaling_transformer_inference_efficiency/attention.py
 
@@ -324,25 +329,27 @@ class AttentionOp(nn.Module):
     local_sum = jnp.moveaxis(local_sum, -2, 1)
     local_max = jnp.moveaxis(local_max, -2, 1)
 
-    local_max = jnp.reshape(local_max, 
-                            (local_max.shape[0], 
-                             local_max.shape[1], 
-                             local_max.shape[2] * local_max.shape[3], 
-                             1)) 
-    local_sum = jnp.reshape(local_sum, 
-                            (local_sum.shape[0], 
-                             local_sum.shape[1], 
-                             local_sum.shape[2] * local_sum.shape[3], 
-                             1)) 
+    local_max = jnp.reshape(local_max,
+                            (local_max.shape[0],
+                             local_max.shape[1],
+                             local_max.shape[2] * local_max.shape[3],
+                             1))
+    local_sum = jnp.reshape(local_sum,
+                            (local_sum.shape[0],
+                             local_sum.shape[1],
+                             local_sum.shape[2] * local_sum.shape[3],
+                             1))
 
-    local_out = self.wv_product(local_exps, value)
+    local_out = self.wv_product(local_exps, value, value_scale)
     return local_out, local_max, local_sum
 
   def apply_attention_dot(
       self,
-      query: Array, 
-      key: Array,   
-      value: Array, 
+      query: Array,
+      key: Array,
+      key_scale: Array,
+      value: Array,
+      value_scale: Array,
       decoder_segment_ids: Array | None,
       model_mode: str = common_types.MODEL_MODE_TRAIN,
   ):
@@ -352,7 +359,9 @@ class AttentionOp(nn.Module):
       query = query.astype(jnp.float32)
       key = key.astype(jnp.float32)
 
-    attn_weights = self.qk_product(query, key)
+    attn_weights = self.qk_product(query, key, key_scale)
+    if self.quantize_kv:
+      attn_weights = attn_weights.astype(jnp.bfloat16)
 
     # Casting softmaxt computation for float32 for model stability.
     if self.float32_logits:
@@ -360,9 +369,9 @@ class AttentionOp(nn.Module):
     attn_mask = self.generate_attention_mask(query, key, decoder_segment_ids, model_mode)
     if attn_mask is not None:
       attn_weights = apply_mask_to_logits(attn_weights, attn_mask)
-    return self.compute_local_attention(attn_weights, value)
+    return self.compute_local_attention(attn_weights, value, value_scale)
 
-  def qk_product(self, query: Array, key: Array) -> Array:
+  def qk_product(self, query: Array, key: Array, key_scale: Array) -> Array:
     """Query-Key product.
 
     Args:
@@ -374,28 +383,34 @@ class AttentionOp(nn.Module):
     Returns:
       results in shape [b, n_kv, n // n_kv,  t, s].
     """
-    b, t, n, d = query.shape  
+    b, t, n, d = query.shape
     n_kv = key.shape[-2]
     assert n_kv == self.num_kv_heads
     query = jnp.reshape(query, (b, t, n_kv, n // n_kv, d))
     result = jnp.einsum('btkgd,bskd->bkgts', query, key)
-    return result # (4, 8, 1, 1, 6)
+    if key_scale:
+      result = jnp.einsum('bkgts,bskd->bkgts', result, key_scale)/quantizations.MAX_INT8
+    return result
 
 
   def wv_product(
       self,
       attn_weights: Array,
-      value: Array) -> Array:
+      value: Array,
+      value_scale: Array,
+      ) -> Array:
     """weighted value product.
 
     Args:
-      attn_weights: Computed results of qk_einsum, in shape [batch_size, num_kv_heads, group_size, q_len, k_len]. 
+      attn_weights: Computed results of qk_einsum, in shape [batch_size, num_kv_heads, group_size, q_len, k_len].
       value: Value projection, in shape of [batch_size, v_len, num_kv_heads, kv_dim].
 
     Returns:
       result in shape [batch_size, q_len, num_kv_heads * group_size, kv_dim]
     """
     out = jnp.einsum('bkgts,bskd->btkgd', attn_weights, value)
+    if value_scale:
+      out = jnp.einsum('btkgd,bskd->btkgd', out, value_scale) / quantizations.MAX_INT8
     b, t, n_kv, g, d = out.shape
     result = jnp.reshape(out, (b, t, n_kv * g, d))
     return result
@@ -409,7 +424,7 @@ class AttentionOp(nn.Module):
     Returns:
       reshaped kv as [b, ..., s, n, d]
     """
-    return jnp.moveaxis(kv, -1, -3)
+    return None if not kv else jnp.moveaxis(kv, -1, -3)
 
   def move_kvlen_axis(self, kv):
     """Move key/value length axis to the end.
@@ -420,7 +435,7 @@ class AttentionOp(nn.Module):
     Returns:
       reshaped kv as [b, ..., n, d, s]
     """
-    return jnp.moveaxis(kv, -3, -1)
+    return None if not kv else jnp.moveaxis(kv, -3, -1)
 
   def cached_kv_shape(self, kv_shape):
     """Cached KV shape.
@@ -445,13 +460,25 @@ class AttentionOp(nn.Module):
     cached_key = self.variable('cache', 'cached_prefill_key',
                                nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
                                self.cached_kv_shape(cache_logical_shape), dtype)
+
+    cached_key_scale = None
     cached_value = self.variable('cache', 'cached_prefill_value',
                                  nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
                                  self.cached_kv_shape(cache_logical_shape), dtype)
+    cached_value_scale = None
     cached_segment_id = self.variable('cache', 'cache_prefill_segment_id',
                   nn.with_logical_partitioning(jnp.zeros, ('cache_batch', 'cache_sequence')),
                   (cache_logical_shape[0], self.max_prefill_predict_length), jnp.int32)
-    return cached_key, cached_value, cached_segment_id
+    if self.quantize_kv:
+      cache_logical_shape = (batch, self.max_prefill_predict_length, heads, 1)
+      cached_key_scale = self.variable('cache', 'cached_prefill_key_scale',
+                                       nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
+                                       self.cached_kv_shape(cache_logical_shape), jnp.bfloat16)
+      cached_value_scale = self.variable('cache', 'cached_prefill_value_scale',
+                                       nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
+                                       self.cached_kv_shape(cache_logical_shape), jnp.bfloat16)
+
+    return cached_key, cached_key_scale, cached_value, cached_value_scale, cached_segment_id
 
   def _get_ar_cache(self, batch, heads, kv_head_size, dtype):
     kv_cache_layout = ('cache_batch', 'cache_heads', 'cache_kv', 'cache_sequence')
@@ -459,20 +486,32 @@ class AttentionOp(nn.Module):
     cached_key = self.variable('cache', 'cached_ar_key',
                                nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
                                self.cached_kv_shape(cache_logical_shape), dtype)
+    cached_key_scale = None
     cached_value = self.variable('cache', 'cached_ar_value',
                                  nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
                                  self.cached_kv_shape(cache_logical_shape), dtype)
+    cached_value_scale = None
     cached_segment_id = self.variable('cache', 'cache_ar_segment_id',
                   nn.with_logical_partitioning(jnp.zeros, ('cache_batch', 'cache_sequence')),
                   (cache_logical_shape[0], self.max_target_length - self.max_prefill_predict_length), jnp.int32)
     cache_index = self.variable('cache', 'cache_ar_index',
                           nn.with_logical_partitioning(jnp.zeros, ()),
                           (1,), jnp.int32)
-    return cached_key, cached_value, cached_segment_id, cache_index
+    if self.quantize_kv:
+      cache_logical_shape = (batch, self.max_prefill_predict_length, heads, 1)
+      cached_key_scale = self.variable('cache', 'cached_ar_key_scale',
+                                       nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
+                                       self.cached_kv_shape(cache_logical_shape), jnp.bfloat16)
+      cached_value_scale = self.variable('cache', 'cached_ar_value_scale',
+                                       nn.with_logical_partitioning(jnp.zeros, kv_cache_layout),
+                                       self.cached_kv_shape(cache_logical_shape), jnp.bfloat16)
+    return cached_key, cached_key_scale, cached_value, cached_value_scale, cached_segment_id, cache_index
 
   def kv_cache_prefill(self,
                         key: Array,
+                        key_scale: Array,
                         value: Array,
+                        value_scale: Array,
                         decoder_segment_ids: Array,
                        ):
       """In prefill mode, we zero out the existing cache, run the computation and
@@ -480,7 +519,9 @@ class AttentionOp(nn.Module):
 
       Args:
         key: in shape [b, s, n, d].
+        key_scale: in shape [b, s, n, 1] if quantized value else None
         value: in shape [b, s, n, d].
+        value_scale: in shape [b, s, n, 1] if quantized value else None
         decoder_segment_ids: [b, s] -- marking segment ids for tokens
 
       Returns:
@@ -490,35 +531,49 @@ class AttentionOp(nn.Module):
       batch, sequence, heads, kv_head_size = key.shape
       assert key.dtype == value.dtype, "Key and Value Dtypes should match."
       assert self.max_prefill_predict_length == sequence, "Set prefill length must match prefill sequence"
-      
-      cached_prefill_key, cached_prefill_value, cached_prefill_segment_id = self._get_prefill_cache(batch, heads, kv_head_size, key.dtype)
+
+      cached_prefill_key, cached_prefill_key_scale,cached_prefill_value, cached_prefill_value_scale,cached_prefill_segment_id = self._get_prefill_cache(batch, heads, kv_head_size, key.dtype)
       self._get_ar_cache(batch, heads, kv_head_size, key.dtype) # initialize it now
 
       key_shaped_for_cache = self.move_kvlen_axis(key)
       value_shaped_for_cache = self.move_kvlen_axis(value)
+      key_scale_shaped_for_cache = self.move_kvlen_axis(key_scale)
+      value_scale_shaped_for_cache = self.move_kvlen_axis(value_scale)
 
       cached_prefill_key.value = key_shaped_for_cache
       cached_prefill_value.value = value_shaped_for_cache
 
+      if key_scale:
+        cached_prefill_key_scale.value = key_scale_shaped_for_cache
+        cached_prefill_value_scale.value = value_scale_shaped_for_cache
+
       if decoder_segment_ids is not None:
         cached_prefill_segment_id.value = decoder_segment_ids
-        
-      return key, value, decoder_segment_ids
-  
 
-  def update_ar_key_value(self, 
+      return key, key_scale, value, value_scale, decoder_segment_ids
+
+
+  def update_ar_key_value(self,
                           one_token_key: Array,
+                          one_token_key_scale: Array,
                           one_token_value: Array,
-                          cached_ar_key: nn.Variable, 
-                          cached_ar_value: nn.Variable, 
+                          one_token_value_scale: Array,
+                          cached_ar_key: nn.Variable,
+                          cached_ar_key_scale: nn.Variable,
+                          cached_ar_value: nn.Variable,
+                          cached_ar_value_scale: nn.Variable,
                           one_hot_indices: Array) -> tuple[Array, Array]:
-    """Adds a single token's results to the ar kv cache 
+    """Adds a single token's results to the ar kv cache
 
     Args:
         one_token_key (Array): Key of one token to add to the cache
+        one_token_key_scale (Array): Key scale of one token to add to the cache
         one_token_value (Array): Value of one token to add to the cache
+        one_token_value_scale (Array): Value of one token to add to the cache
         cached_ar_key (nn.Variable): Cached keys to add new token key to
+        cached_ar_key_scale (nn.Variable): Cached keys to add new token key to
         cached_ar_value (nn.Variable): Cached values to add new token value to
+        cached_ar_value_scale (nn.Variable): Cached values to add new token value to
         one_hot_indices (Array): Location of the new token within the cache
 
     Returns:
@@ -528,27 +583,37 @@ class AttentionOp(nn.Module):
     # value, we move the length axis to the back
     one_token_key = self.move_kvlen_axis(one_token_key)
     one_token_value = self.move_kvlen_axis(one_token_value)
+    one_token_key_scale = self.move_kvlen_axis(one_token_key_scale)
+    one_token_value_scale = self.move_kvlen_axis(one_token_value_scale)
 
     # We implement an efficient scatter into the cache via one-hot broadcast and addition.
     ar_key = cached_ar_key.value + one_token_key * one_hot_indices
     ar_value = cached_ar_value.value + one_token_value * one_hot_indices
     cached_ar_key.value = ar_key
     cached_ar_value.value = ar_value
-
+    if ar_key_scale:
+      ar_key_scale = cached_ar_key_scale.value + one_token_key_scale * one_hot_indices
+      ar_value_scale = cached_ar_value_scale.value + one_token_value_scale * one_hot_indices
+      cached_ar_key_scale.value = ar_key_scale
+      cached_ar_value_scale.value = ar_value_scale
     # Move the keys and values back to their original shapes.
-    return self.revert_kvlen_axis(ar_key), self.revert_kvlen_axis(ar_value)
-    
+    return self.revert_kvlen_axis(ar_key), self.revert_kvlen_axis(ar_key_scale), self.revert_kvlen_axis(ar_value), self.revert_kvlen_axis(ar_value_scale)
+
 
   def kv_cache_autoregressive(self,
                               key: Array,
+                              key_scale: Array,
                               value: Array,
+                              value_scale: Array
                              ):
       """In autoregressive mode, we update the cache for this entry and
          then return the full cache.
 
       Args:
         key: in shape [b, 1, n, d].
+        key_scale: in shape [1, 1, 1, d] if quantized else None
         value: in shape [b, 1, n, d].
+        value_scale: in shape [b, 1, n, 1] if quantized else
         decoder_segment_ids: [b, 1] -- marking segment ids for tokens
 
       Returns:
@@ -563,7 +628,7 @@ class AttentionOp(nn.Module):
       if not is_initialized:
         raise ValueError("Error, we can't do autoregression if we haven't seeded the KV Cache.")
 
-      cached_ar_key, cached_ar_value, cached_ar_segment_id, cache_ar_index = self._get_ar_cache(batch, heads, kv_head_size, key.dtype)
+      cached_ar_key, cached_ar_key_scale,cached_ar_value, cached_ar_value_scale, cached_ar_segment_id, cache_ar_index = self._get_ar_cache(batch, heads, kv_head_size, key.dtype)
       _, _, _, length = cached_ar_key.value.shape
 
       # Create a OHE of the current index. NOTE: the index is increased below.
@@ -571,20 +636,22 @@ class AttentionOp(nn.Module):
       one_hot_indices_int32 = jax.nn.one_hot(cache_ar_index.value, length, dtype=jnp.int32)
 
       # Update key, value caches with our new 1d spatial slices.
-      ar_key, ar_value = self.update_ar_key_value(key, value, cached_ar_key, cached_ar_value, one_hot_indices)
+      ar_key, ar_key_scale, ar_value, ar_value_scale = self.update_ar_key_value(key, key_scale, value, value_scale, cached_ar_key, cached_ar_key_scale, cached_ar_value, cached_ar_value_scale, one_hot_indices)
       cached_ar_segment_id.value = cached_ar_segment_id.value + common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR * one_hot_indices_int32
       cache_ar_index.value = jnp.mod(cache_ar_index.value + 1, self.max_target_length)
 
       # Prep are return both prefill and ar caches
-      cached_prefill_key, cached_prefill_value, cached_prefill_segment_id = self._get_prefill_cache(self.max_target_length, heads, kv_head_size, key.dtype)
-      cached_prefill =  self.revert_kvlen_axis(cached_prefill_key.value), self.revert_kvlen_axis(cached_prefill_value.value), cached_prefill_segment_id.value
-      return cached_prefill, (ar_key, ar_value, cached_ar_segment_id.value)
-
+      cached_prefill_key, cached_prefill_key_scale, cached_prefill_value, cached_prefill_value_scale, cached_prefill_segment_id = self._get_prefill_cache(self.max_target_length, heads, kv_head_size, key.dtype)
+      cached_prefill =  self.revert_kvlen_axis(cached_prefill_key.value), self.revert_kvlen_axis(cached_prefill_key_scale.value),self.revert_kvlen_axis(cached_prefill_value.value), self.revert_kvlen_axis(cached_prefill_value_scale.value), cached_prefill_segment_id.value
+      cached_ar = (ar_key, ar_key_scale, ar_value, ar_value_scale, cached_ar_segment_id.value)
+      return cached_prefill, cached_ar
 
   def kv_cache(
       self,
       key: Array,
+      key_scale: Array,
       value: Array,
+      value_scale: Array,
       decoder_segment_ids: Array,
       model_mode: str
   ) -> tuple:
@@ -598,7 +665,9 @@ class AttentionOp(nn.Module):
 
     Args:
       key: in shape [b, s, n, d].
+      key_scale: in shape [b, s, 1, d].
       value: in shape [b, s, n, d].
+      value_scale: in shape [b, s, 1, d].
       model_mode: model mode controlling model
 
     Returns:
@@ -607,19 +676,19 @@ class AttentionOp(nn.Module):
     """
     if key.shape != value.shape:
       raise ValueError(f"Can't KV cache with mismatched shapes {key.shape=}, {value.shape=}")
-    
+
 
     if model_mode == common_types.MODEL_MODE_TRAIN:
-      return (key, value, decoder_segment_ids), None
+      return (key, key_scale, value, value_scale, decoder_segment_ids), None
     elif model_mode == common_types.MODEL_MODE_PREFILL:
-      return self.kv_cache_prefill(key, value, decoder_segment_ids), None
+      return self.kv_cache_prefill(key, key_scale, value, value_scale, decoder_segment_ids), None
     elif model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
-      return self.kv_cache_autoregressive(key, value)
+      return self.kv_cache_autoregressive(key, key_scale, value, value_scale)
     else:
       raise ValueError(f"Model Mode isn't supported! {model_mode=}")
-  
-  
-  def normalize_attention(self, 
+
+
+  def normalize_attention(self,
                           local_outs,
                           local_maxes,
                           local_sums):
@@ -631,7 +700,7 @@ class AttentionOp(nn.Module):
         local_sums (list): List of exponential sum entries for each local attention
 
     Returns:
-        Array: Combined attention that has been normalized 
+        Array: Combined attention that has been normalized
     """
     # Based on https://github.com/google-research/google-research/blob/master/scaling_transformer_inference_efficiency/attention.py
     global_max = functools.reduce(jnp.maximum, local_maxes)
@@ -648,17 +717,19 @@ class AttentionOp(nn.Module):
 
 
   @nn.compact
-  def __call__(self, query, key, value, decoder_segment_ids, model_mode):
-    prefill_kv_cache, ar_kv_cache = self.kv_cache(key, value, decoder_segment_ids, model_mode)
+  def __call__(self, query, key, key_scale, value, value_scale, decoder_segment_ids, model_mode):
+    prefill_kv_cache, ar_kv_cache = self.kv_cache(key, key_scale, value, value_scale, decoder_segment_ids, model_mode)
 
     prefill_unnormalized_output, prefill_exponentials_max, prefill_exponentials_sum = self.apply_attention(
       query=query,
       key=prefill_kv_cache[0],
-      value=prefill_kv_cache[1],
-      decoder_segment_ids=prefill_kv_cache[2],
+      key_scale=prefill_kv_cache[1],
+      value=prefill_kv_cache[2],
+      value_scale=prefill_kv_cache[3],
+      decoder_segment_ids=prefill_kv_cache[4],
       model_mode=model_mode,
     )
-    
+
     # Return the "prefill" cache if it actually the combined prefill+ar kv cache
     if ar_kv_cache is None:
       if prefill_exponentials_sum is not None:
@@ -668,8 +739,10 @@ class AttentionOp(nn.Module):
     ar_unnormalized_output, ar_exponentials_max, ar_exponentials_sum  = self.apply_attention(
       query=query,
       key=ar_kv_cache[0],
-      value=ar_kv_cache[1],
-      decoder_segment_ids=ar_kv_cache[2],
+      key_scale=ar_kv_cache[1],
+      value=ar_kv_cache[2],
+      value_scale=ar_kv_cache[3],
+      decoder_segment_ids=ar_kv_cache[4],
       model_mode=model_mode,
     )
 
@@ -707,9 +780,7 @@ class Attention(nn.Module):
   num_kv_heads: int
   head_dim: int
   max_target_length: int
-  mesh: Mesh
-  attention_kernel: str
-  dtype: DType = jnp.float32
+  mesh: Mesh.
   weight_dtype: DType = jnp.float32
   max_prefill_predict_length: int = -1
   dropout_rate: float = 0.
@@ -717,6 +788,8 @@ class Attention(nn.Module):
   float32_qk_product: bool = False  # computes logits in float32 for stability.
   float32_logits: bool = False  # cast logits in float32 for stability.
   quant: Optional[Quant] = None
+  quantize_kv: bool = quantizations.configure_kv_quantization(config)
+
 
 
   query_axis_names: AxisNames = (BATCH, LENGTH, HEAD, D_KV)
@@ -861,6 +934,11 @@ class Attention(nn.Module):
     key = checkpoint_name(key, 'key_proj')
     value = nn.with_logical_constraint(value, self.value_axis_names)
     value = checkpoint_name(value, 'value_proj')
+    key_scale = None
+    value_scale = None
+    if self.quantize_kv:
+      key, key_scale = quantizations.quantize_kv(key)
+      value, value_scale = quantizations.quantize_kv(value)
 
     attention_op = AttentionOp(mesh=self.mesh,
                                attention_kernel=self.attention_kernel,
@@ -874,7 +952,7 @@ class Attention(nn.Module):
                                dropout_rate = self.dropout_rate,
                                dtype=self.dtype)
 
-    out = attention_op(query, key, value, decoder_segment_ids, model_mode)
+    out = attention_op(query, key, key_scale, value, value_scale, decoder_segment_ids, model_mode)
 
     out = nn.with_logical_constraint(out, self.out_axis_names)
 

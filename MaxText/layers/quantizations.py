@@ -18,7 +18,7 @@ import functools
 
 from aqt.jax.v2 import config as aqt_config
 from aqt.jax.v2.flax import aqt_flax
-from common_types import Config
+from common_types import Array, Config
 from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
@@ -126,3 +126,15 @@ def remove_quantized_params(params, aqt_vars):
       v = {}
     tree_flat[i] = v
   return tree_unflatten(tree_struct, tree_flat)
+
+def configure_kv_quantization(config: Config):
+  """ Configure kv quantization based on user config."""
+  return False if not config.kv_quantization else True
+
+MAX_INT8 = 127.5
+
+def quantize_kv(kv: Array):
+  """Quantize key/values stored in kvcache."""
+  scale = jnp.max(jnp.abs(kv), axis=-1, keepdims=True)
+  weight = jnp.int8(jnp.rint(kv * (MAX_INT8 / scale)))
+  return weight, scale
