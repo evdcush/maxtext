@@ -25,7 +25,7 @@ def main(config):
   prefill_result = engine.prefill(
       params=params, padded_tokens=tokens, true_length=true_length
   )
-  slot=1
+  slot=0
 
   decode_state = engine.init_decode_state()
   decode_state = engine.insert(

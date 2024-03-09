@@ -62,6 +62,7 @@ class MaxEngine(engine_api.Engine):
     self.state_mesh_annotations = None
 
   def load_params(self, *args, **kwargs) -> Params:
+    ''' Load Parameters, typically from GCS ''' 
     state, self.state_mesh_annotations = max_utils.setup_decode_state(
       self.model, self.config, self.rng, self._mesh, None
     )
@@ -71,7 +72,7 @@ class MaxEngine(engine_api.Engine):
     self.kv_cache_shardings = jax.tree_map(lambda x : jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
 
-    return state.params
+    return {"params" : state.params}
 
 
   @functools.partial(jax.jit, static_argnums=(0,))
@@ -109,7 +110,7 @@ class MaxEngine(engine_api.Engine):
 
     flat_logits, new_vars = self.model.apply(
       {
-          "params": params
+          "params": params["params"]
       },
       input_tokens,
       positions,
@@ -130,6 +131,7 @@ class MaxEngine(engine_api.Engine):
   def generate(
       self, params: Params, decode_state: DecodeState
   ) -> Tuple[DecodeState, engine_api.ResultTokens]:
+    '''Run one generate step'''
     previous_logits = decode_state['logits']
 
     new_token = inference_utils.sampling(previous_logits, self.rng, self.config.decode_sampling_strategy,
@@ -139,15 +141,15 @@ class MaxEngine(engine_api.Engine):
 
     out_logits, new_vars = self.model.apply(
       {
-          "params": params,
-          "cache": decode_state['cache']
+          'params': params['params'],
+          'cache': decode_state['cache']
       },
       new_token,
       decode_state['next_pos'],
       enable_dropout=False,
       model_mode=common_types.MODEL_MODE_AUTOREGRESSIVE,
       rngs={'params': self.rng},
-      mutable=["cache"]
+      mutable=['cache']
     )
 
     all_valid = jnp.ones(new_token.shape, dtype=jnp.int8)
@@ -177,6 +179,7 @@ class MaxEngine(engine_api.Engine):
       decode_state: DecodeState,
       slot: int,
   ) -> DecodeState:
+    ''' Insert into KV cache '''
     unboxed_prefix = max_utils.unbox_logicallypartioned(prefix)
 
     def copy(path, partial_cache, full_cache, annotations):
@@ -235,7 +238,7 @@ class MaxEngine(engine_api.Engine):
                    dtype=jnp.int32)
       _, cache = self.model.apply(
         {
-            "params": abstract_params
+            'params': abstract_params
         },
         x,
         x,
