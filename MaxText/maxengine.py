@@ -71,9 +71,35 @@ class MaxEngine(engine_api.Engine):
     self.kv_cache_annotations = max_utils.get_kv_cache_annotations(self.model, self.config, self.rng, self._mesh)
     self.kv_cache_shardings = jax.tree_map(lambda x : jax.sharding.NamedSharding(self._mesh, x), self.kv_cache_annotations)
 
+    if not self.model.quant:
+      return {"params" : state.params}
+    else:
+      self.model.quant.quant_mode = quantizations.get_quant_mode('convert')
 
-    return {"params" : state.params}
+      @jax.jit
+      def model_apply(_p, _rng):
+        return self.model.apply(
+          {
+              "params": _p
+          },
+          jnp.ones( (1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+          jnp.ones( (1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+          decoder_segment_ids=jnp.zeros((1, self.config.max_prefill_predict_length), dtype=jnp.int32),
+          enable_dropout=False,
+          model_mode=common_types.MODEL_MODE_PREFILL,
+          rngs={'params': _rng},
+          mutable=True
+        )
+      
+      _, new_vars = model_apply(state.params, self.rng)
 
+      params = {}
+      params['aqt'] = new_vars['aqt']
+      # Remove param values which have corresponding qtensors in aqt to save memory.
+      params['params'] = quantizations.remove_quantized_params(state.params, new_vars['aqt'])
+
+      self.model.quant.quant_mode = quantizations.get_quant_mode('serve')
+      return params
 
   @functools.partial(jax.jit, static_argnums=(0,))
   def prefill(
@@ -109,9 +135,7 @@ class MaxEngine(engine_api.Engine):
     sequence_indicator = jnp.expand_dims(one_d_output, 0)
 
     flat_logits, new_vars = self.model.apply(
-      {
-          "params": params["params"]
-      },
+      params,
       input_tokens,
       positions,
       decoder_segment_ids=sequence_indicator,
@@ -140,10 +164,7 @@ class MaxEngine(engine_api.Engine):
                                         temperature=self.config.decode_sampling_temperature)
 
     out_logits, new_vars = self.model.apply(
-      {
-          'params': params['params'],
-          'cache': decode_state['cache']
-      },
+      params | { 'cache': decode_state['cache']},
       new_token,
       decode_state['next_pos'],
       enable_dropout=False,
