@@ -63,6 +63,7 @@ class MaxEngine(engine_api.Engine):
 
   def load_params(self, *args, **kwargs) -> Params:
     ''' Load Parameters, typically from GCS ''' 
+    # pylint: disable=unused-argument
     state, self.state_mesh_annotations = max_utils.setup_decode_state(
       self.model, self.config, self.rng, self._mesh, None
     )
@@ -90,7 +91,7 @@ class MaxEngine(engine_api.Engine):
           rngs={'params': _rng},
           mutable=True
         )
-      
+
       _, new_vars = model_apply(state.params, self.rng)
 
       params = {}
@@ -254,6 +255,7 @@ class MaxEngine(engine_api.Engine):
 
   def init_decode_state(self, *args, **kwargs) -> DecodeState:
     """Initialises any state which a generation step transforms."""
+    # pylint: disable=unused-argument
     def init(abstract_params):
       x = jnp.ones( (int(self.config.per_device_batch_size * jax.device_count()), self.config.max_prefill_predict_length),
                    dtype=jnp.int32)
