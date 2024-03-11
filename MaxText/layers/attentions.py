@@ -599,7 +599,7 @@ class AttentionOp(nn.Module):
       # Update key, value caches with our new 1d spatial slices.
       ar_key, ar_value = self.update_ar_key_value(key, value, cached_ar_key, cached_ar_value, cache_ar_index.value)
       cached_ar_segment_id.value = cached_ar_segment_id.value + common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR * one_hot_indices_int32
-      cache_ar_index.value = jnp.mod(cache_ar_index.value + 1, self.max_target_length)
+      cache_ar_index.value = jnp.mod(cache_ar_index.value + 1, self.max_target_length - self.max_prefill_predict_length)
 
       # Prep are return both prefill and ar caches
       cached_prefill_key, cached_prefill_value, cached_prefill_segment_id = self._get_prefill_cache(self.max_target_length, heads, kv_head_size, key.dtype)
